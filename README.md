@@ -139,4 +139,4 @@ Connect with `io({ auth: { token: accessToken } })`
 (`stack` is hidden when `NODE_ENV=production`)
 
 ## Author
-<Abhina Krishna> 
+Abhina Krishna 
