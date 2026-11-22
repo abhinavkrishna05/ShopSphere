@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShopSphere</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f3f4f6;color:#111827}
+  header{background:#111827;color:#fff;padding:10px 16px;display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+  header h1{font-size:18px;margin:0 12px 0 0}
+  nav{display:flex;flex-wrap:wrap;gap:6px;flex:1}
+  nav button{background:transparent;color:#d1d5db;border:1px solid #374151;padding:6px 10px;border-radius:6px;cursor:pointer}
+  nav button.active{background:#4f46e5;color:#fff;border-color:#4f46e5}
+  #who{font-size:13px;color:#d1d5db}
+  main{max-width:1100px;margin:16px auto;padding:0 12px}
+  h2{margin:8px 0 12px}
+  .card{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+  .muted{color:#6b7280;font-size:13px}
+  .price{font-weight:700;color:#4f46e5;font-size:18px}
+  input,select,textarea{padding:8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;max-width:100%}
+  button{padding:7px 12px;border:0;border-radius:6px;background:#4f46e5;color:#fff;cursor:pointer;font-size:14px}
+  button:hover{opacity:.9}
+  button.danger{background:#dc2626}
+  button.gray{background:#6b7280}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}
+  th,td{padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:left;font-size:14px}
+  th{background:#f9fafb}
+  .tbl{overflow-x:auto}
+  .badge{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:#e5e7eb}
+  .b-PENDING{background:#fef3c7;color:#92400e}.b-CONFIRMED{background:#dbeafe;color:#1e40af}
+  .b-SHIPPED{background:#ede9fe;color:#5b21b6}.b-DELIVERED{background:#d1fae5;color:#065f46}
+  .b-CANCELLED{background:#fee2e2;color:#991b1b}
+  .low{color:#dc2626;font-weight:600}
+  .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+  .two label{display:block;font-size:13px;margin:8px 0 3px}
+  .two input,.two select{width:100%}
+  .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+  #toasts{position:fixed;right:12px;top:12px;display:flex;flex-direction:column;gap:8px;z-index:99}
+  .toast{padding:10px 14px;border-radius:8px;color:#fff;max-width:320px;box-shadow:0 4px 10px rgba(0,0,0,.2);font-size:14px}
+  .toast.ok{background:#059669}.toast.err{background:#dc2626}.toast.info{background:#2563eb}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛒 ShopSphere</h1>
+  <nav id="nav"></nav>
+  <span id="who"></span>
+</header>
+<main id="view"></main>
+<div id="toasts"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+/* ============ STATE & HELPERS ============ */
+function readUser() { try { return JSON.parse(localStorage.getItem('user') || 'null'); } catch (e) { return null; } }
+const S = {
+  access: localStorage.getItem('access') || null,
+  refresh: localStorage.getItem('refresh') || null,
+  user: readUser(),
+  socket: null,
+  view: 'products',
+  pq: { page: 1 },
+  ostatus: ''
+};
+const el = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = (n) => '₹' + Number(n || 0).toFixed(2);
+const fmtDate = (d) => new Date(d).toLocaleString();
+const role = () => (S.user ? S.user.role : null);
+const setView = (html) => { el('view').innerHTML = html; };
+
+function persist() {
+  if (S.access) localStorage.setItem('access', S.access); else localStorage.removeItem('access');
+  if (S.refresh) localStorage.setItem('refresh', S.refresh); else localStorage.removeItem('refresh');
+  if (S.user) localStorage.setItem('user', JSON.stringify(S.user)); else localStorage.removeItem('user');
+}
+
+function toast(msg, type = 'info') {
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.textContent = msg;
+  el('toasts').appendChild(t);
+  setTimeout(() => t.remove(), 4500);
+}
+
+async function run(fn, ...args) {
+  try { await fn(...args); } catch (e) { toast(e.message || 'Something went wrong', 'err'); }
+}
+
+/* ============ API ============ */
+async function refreshTokens() {
+  try {
+    const res = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refreshToken: S.refresh })
+    });
+    if (!res.ok) return false;
+    const d = await res.json();
+    S.access = d.accessToken;
+    S.refresh = d.refreshToken;
+    persist();
+    return true;
+  } catch (e) { return false; }
+}
+
+async function api(path, opts = {}, retry = true) {
+  const { method = 'GET', body, auth = true } = opts;
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth && S.access) headers.Authorization = 'Bearer ' + S.access;
+  const res = await fetch('/api' + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* empty body */ }
+  if (res.status === 401 && auth && retry && S.refresh && !path.startsWith('/auth/')) {
+    if (await refreshTokens()) return api(path, opts, false);
+    forceLogout();
+    throw new Error('Session expired. Please login again');
+  }
+  if (!res.ok) throw new Error(data.message || 'Request failed (' + res.status + ')');
+  return data;
+}
+
+/* ============ SOCKET ============ */
+function connectSocket() {
+  if (S.socket) { S.socket.disconnect(); S.socket = null; }
+  if (!S.access) return;
+  S.socket = io({ auth: (cb) => cb({ token: S.access }) });
+  S.socket.on('orderStatusUpdated', (p) => {
+    toast('📦 ' + p.message, 'info');
+    if (S.view === 'myorders') go('myorders');
+  });
+  S.socket.on('lowStockAlert', (p) => toast('⚠️ Low stock: ' + p.name + ' (' + p.stock + ' left)', 'err'));
+  S.socket.on('newOrder', (p) => {
+    toast('🛍️ New order ' + p.orderId + ' (' + money(p.totalAmount) + ')', 'ok');
+    if (S.view === 'orders') go('orders');
+  });
+}
+
+/* ============ NAV / ROUTER ============ */
+function tabs() {
+  const t = [['products', 'Products']];
+  const r = role();
+  if (r === 'customer') t.push(['cart', 'Cart'], ['myorders', 'My Orders']);
+  if (r === 'seller' || r === 'admin') t.push(['manage', 'Manage Products'], ['orders', 'Orders'], ['reports', 'Reports']);
+  if (r === 'admin') t.push(['categories', 'Categories'], ['users', 'Users']);
+  if (S.user) t.push(['profile', 'Profile']); else t.push(['login', 'Login / Register']);
+  return t;
+}
+
+function renderNav() {
+  el('nav').innerHTML = tabs()
+    .map(([k, l]) => `<button class="${S.view === k ? 'active' : ''}" onclick="go('${k}')">${esc(l)}</button>`)
+    .join('');
+  el('who').innerHTML = S.user
+    ? `${esc(S.user.name)} (${esc(S.user.role)}) <button class="gray" onclick="run(logout)">Logout</button>`
+    : '';
+}
+
+const VIEWS = {
+  login: vLogin, products: vProducts, cart: vCart, myorders: vMyOrders,
+  manage: vManage, orders: vOrders, reports: vReports,
+  categories: vCategories, users: vUsers, profile: vProfile
+};
+
+async function go(view) {
+  S.view = view;
+  renderNav();
+  try { await VIEWS[view](); }
+  catch (e) { setView(`<div class="card"><b class="low">Error:</b> ${esc(e.message)}</div>`); }
+}
+
+/* ============ AUTH ============ */
+function vLogin() {
+  setView(`
+  <div class="two">
+    <div class="card"><h2>Login</h2>
+      <form onsubmit="event.preventDefault();run(doLogin)">
+        <label>Email</label><input id="l_email" type="email" required value="customer@example.com">
+        <label>Password</label><input id="l_pass" type="password" required value="Customer@123">
+        <p><button>Login</button></p>
+        <p class="muted">Demo: admin@example.com / Admin@123 · seller@example.com / Seller@123 · customer@example.com / Customer@123</p>
+      </form></div>
+    <div class="card"><h2>Register</h2>
+      <form onsubmit="event.preventDefault();run(doRegister)">
+        <label>Name</label><input id="r_name" required minlength="2">
+        <label>Email</label><input id="r_email" type="email" required>
+        <label>Password (min 6)</label><input id="r_pass" type="password" required minlength="6">
+        <label>Role</label><select id="r_role"><option value="customer">Customer</option><option value="seller">Seller</option></select>
+        <p><button>Create account</button></p>
+      </form></div>
+  </div>`);
+}
+
+async function doLogin() {
+  const d = await api('/auth/login', { method: 'POST', auth: false, body: { email: el('l_email').value.trim(), password: el('l_pass').value } });
+  S.access = d.accessToken; S.refresh = d.refreshToken; S.user = d.user; persist();
+  connectSocket();
+  toast('Welcome, ' + d.user.name, 'ok');
+  go('products');
+}
+
+async function doRegister() {
+  const email = el('r_email').value.trim();
+  const password = el('r_pass').value;
+  await api('/auth/register', { method: 'POST', auth: false, body: { name: el('r_name').value.trim(), email, password, role: el('r_role').value } });
+  toast('Registered! Logging you in...', 'ok');
+  const d = await api('/auth/login', { method: 'POST', auth: false, body: { email, password } });
+  S.access = d.accessToken; S.refresh = d.refreshToken; S.user = d.user; persist();
+  connectSocket();
+  go('products');
+}
+
+async function logout() {
+  try { if (S.refresh) await api('/auth/logout', { method: 'POST', auth: false, body: { refreshToken: S.refresh } }); } catch (e) { /* ignore */ }
+  clearSession();
+  toast('Logged out', 'info');
+  go('products');
+}
+
+function clearSession() {
+  S.access = S.refresh = S.user = null;
+  persist();
+  if (S.socket) { S.socket.disconnect(); S.socket = null; }
+}
+
+function forceLogout() {
+  clearSession();
+  toast('Session expired. Please login again', 'err');
+  go('login');
+}
+
+/* ============ PRODUCTS (public) ============ */
+async function vProducts() {
+  const cats = (await api('/categories', { auth: false })).data;
+  const q = S.pq;
+  const qs = new URLSearchParams();
+  qs.set('page', q.page || 1);
+  qs.set('limit', 8);
+  ['search', 'category', 'minPrice', 'maxPrice', 'sort'].forEach((k) => { if (q[k]) qs.set(k, q[k]); });
+  const res = await api('/products?' + qs.toString(), { auth: false });
+  const pg = res.pagination;
+  const sorts = [['', 'Default (relevance/newest)'], ['price_asc', 'Price: Low → High'], ['price_desc', 'Price: High → Low'], ['newest', 'Newest'], ['oldest', 'Oldest'], ['name', 'Name A-Z'], ['-name', 'Name Z-A']];
+
+  const filters = `
+  <div class="card row">
+    <input id="f_search" placeholder="Search..." value="${esc(q.search || '')}">
+    <select id="f_cat"><option value="">All categories</option>${cats.map((c) => `<option value="${c._id}" ${q.category === c._id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select>
+    <input id="f_min" type="number" min="0" placeholder="Min ₹" style="width:100px" value="${esc(q.minPrice || '')}">
+    <input id="f_max" type="number" min="0" placeholder="Max ₹" style="width:100px" value="${esc(q.maxPrice || '')}">
+    <select id="f_sort">${sorts.map(([v, l]) => `<option value="${v}" ${(q.sort || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <button onclick="applyFilters()">Apply</button>
+    <button class="gray" onclick="resetFilters()">Reset</button>
+  </div>`;
+
+  const cards = res.data.map((p) => `
+    <div class="card">
+      <h3 style="margin:0 0 4px">${esc(p.name)}</h3>
+      <div class="muted">${esc(p.category ? p.category.name : 'No category')} · by ${esc(p.seller ? p.seller.name : 'unknown')}</div>
+      <p class="muted">${esc(p.description)}</p>
+      <div class="price">${money(p.price)}</div>
+      <div class="${p.stock < 5 ? 'low' : 'muted'}">${p.stock > 0 ? 'In stock: ' + p.stock : 'Out of stock'}</div>
+      ${role() === 'customer' && p.stock > 0 ? `<div class="row" style="margin-top:8px"><input type="number" id="qty-${p._id}" min="1" max="${p.stock}" value="1" style="width:70px"><button onclick="run(addToCart,'${p._id}')">Add to cart</button></div>` : ''}
+      ${!S.user ? '<p class="muted">Login to buy</p>' : ''}
+    </div>`).join('');
+
+  setView(`<h2>Products</h2>${filters}
+    <div class="grid">${cards || '<p class="muted">No products found.</p>'}</div>
+    <div class="row" style="margin-top:14px;justify-content:center">
+      <button class="gray" ${pg.page <= 1 ? 'disabled' : ''} onclick="setPage(${pg.page - 1})">← Prev</button>
+      <span>Page ${pg.page} / ${Math.max(pg.pages, 1)} (${pg.total} items)</span>
+      <button class="gray" ${pg.page >= pg.pages ? 'disabled' : ''} onclick="setPage(${pg.page + 1})">Next →</button>
+    </div>`);
+}
+
+function applyFilters() {
+  S.pq = { page: 1, search: el('f_search').value.trim(), category: el('f_cat').value, minPrice: el('f_min').value, maxPrice: el('f_max').value, sort: el('f_sort').value };
+  go('products');
+}
+function resetFilters() { S.pq = { page: 1 }; go('products'); }
+function setPage(n) { S.pq.page = n; go('products'); }
+
+async function addToCart(id) {
+  const qty = parseInt(el('qty-' + id).value, 10) || 1;
+  await api('/cart/items', { method: 'POST', body: { productId: id, quantity: qty } });
+  toast('Added to cart', 'ok');
+}
+
+/* ============ CART (customer) ============ */
+async function vCart() {
+  const c = (await api('/cart')).data;
+  if (!c.items.length) { setView('<h2>Your Cart</h2><div class="card muted">Cart is empty.</div>'); return; }
+  const rows = c.items.map((i) => `
+    <tr><td>${esc(i.product.name)}</td><td>${money(i.product.price)}</td>
+    <td><input type="number" min="1" max="${i.product.stock}" value="${i.quantity}" id="cq-${i.product._id}" style="width:70px"></td>
+    <td>${money(i.subtotal)}</td>
+    <td><button onclick="run(updCart,'${i.product._id}')">Update</button> <button class="danger" onclick="run(rmCart,'${i.product._id}')">Remove</button></td></tr>`).join('');
+  const f = (k, label, ph, val = '') => `<div><label class="muted">${label}</label><br><input id="sa_${k}" placeholder="${ph}" value="${val}" style="width:100%"></div>`;
+  setView(`<h2>Your Cart</h2>
+    <div class="tbl"><table><tr><th>Product</th><th>Price</th><th>Qty</th><th>Subtotal</th><th></th></tr>${rows}</table></div>
+    <h3>Total: <span class="price">${money(c.totalAmount)}</span> (${c.totalItems} items)</h3>
+    <div class="card"><h3>Shipping Address (Payment is simulated)</h3>
+      <div class="form-grid">
+        ${f('fullName', 'Full name', 'John Doe')}${f('phone', 'Phone', '9999999999')}
+        ${f('addressLine', 'Address', '123 Main Street')}${f('city', 'City', 'Gurugram')}
+        ${f('state', 'State', 'Haryana')}${f('postalCode', 'Postal code', '122001')}
+        ${f('country', 'Country', 'India', 'India')}
+      </div>
+      <p><button onclick="run(checkout)">Place Order</button></p></div>`);
+}
+
+async function updCart(id) {
+  await api('/cart/items/' + id, { method: 'PATCH', body: { quantity: parseInt(el('cq-' + id).value, 10) } });
+  toast('Cart updated', 'ok'); go('cart');
+}
+async function rmCart(id) {
+  await api('/cart/items/' + id, { method: 'DELETE' });
+  toast('Removed', 'ok'); go('cart');
+}
+async function checkout() {
+  const shippingAddress = {};
+  ['fullName', 'phone', 'addressLine', 'city', 'state', 'postalCode', 'country'].forEach((k) => {
+    const v = el('sa_' + k).value.trim();
+    if (v) shippingAddress[k] = v;
+  });
+  await api('/orders', { method: 'POST', body: { shippingAddress } });
+  toast('Order placed successfully!', 'ok');
+  go('myorders');
+}
+
+/* ============ ORDERS ============ */
+function orderCard(o, manager) {
+  const items = o.items.map((i) => `<li>${esc(i.name)} × ${i.quantity} @ ${money(i.price)}</li>`).join('');
+  const a = o.shippingAddress || {};
+  const total = manager && o.sellerTotal !== undefined ? `Your items total: ${money(o.sellerTotal)} (order total ${money(o.totalAmount)})` : `Total: ${money(o.totalAmount)}`;
+  const who = manager ? `<div class="muted">Customer: ${esc(o.customer ? o.customer.name + ' (' + o.customer.email + ')' : 'deleted user')}</div>` : '';
+  const ctrl = manager ? `<div class="row" style="margin-top:8px">
+      <select id="st-${o._id}">${['PENDING', 'CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED'].map((s) => `<option ${s === o.status ? 'selected' : ''}>${s}</option>`).join('')}</select>
+      <button onclick="run(updStatus,'${o._id}')">Update status</button></div>` : '';
+  return `<div class="card" style="margin-bottom:10px">
+    <div class="row" style="justify-content:space-between"><b>#${esc(o._id)}</b><span class="badge b-${o.status}">${o.status}</span></div>
+    <div class="muted">${fmtDate(o.createdAt)} · Payment: ${esc(o.paymentStatus)}</div>${who}
+    <ul>${items}</ul><b>${total}</b>
+    <div class="muted">Ship to: ${esc(a.fullName)}, ${esc(a.addressLine)}, ${esc(a.city)}, ${esc(a.state)} ${esc(a.postalCode)}, ${esc(a.country)} · ${esc(a.phone)}</div>${ctrl}</div>`;
+}
+
+async function vMyOrders() {
+  const res = await api('/orders/my?limit=50');
+  setView('<h2>My Orders</h2>' + (res.data.map((o) => orderCard(o, false)).join('') || '<div class="card muted">No orders yet.</div>'));
+}
+
+async function vOrders() {
+  const res = await api('/orders?limit=50' + (S.ostatus ? '&status=' + S.ostatus : ''));
+  setView(`<h2>Orders</h2><div class="row"><label>Filter:</label>
+    <select id="o_filter" onchange="S.ostatus=this.value;go('orders')">
+      ${['', 'PENDING', 'CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED'].map((s) => `<option value="${s}" ${S.ostatus === s ? 'selected' : ''}>${s || 'All'}</option>`).join('')}
+    </select></div>` + (res.data.map((o) => orderCard(o, true)).join('') || '<div class="card muted">No orders found.</div>'));
+}
+
+async function updStatus(id) {
+  await api('/orders/' + id + '/status', { method: 'PATCH', body: { status: el('st-' + id).value } });
+  toast('Status updated', 'ok'); go('orders');
+}
+
+/* ============ MANAGE PRODUCTS (seller/admin) ============ */
+async function vManage() {
+  const cats = (await api('/categories', { auth: false })).data;
+  const res = await api('/products?limit=100&sort=newest', { auth: false });
+  const mine = role() === 'admin' ? res.data : res.data.filter((p) => p.seller && String(p.seller._id) === String(S.user._id));
+  const rows = mine.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.category ? p.category.name : '-')}</td><td>${money(p.price)}</td>
+    <td class="${p.stock < 5 ? 'low' : ''}">${p.stock}</td>
+    <td><button onclick="run(editProduct,'${p._id}',${p.price},${p.stock})">Edit price/stock</button> <button class="danger" onclick="run(delProduct,'${p._id}')">Delete</button></td></tr>`).join('');
+  setView(`<h2>Manage Products</h2>
+    <div class="card"><h3>Add Product</h3><div class="form-grid">
+      <input id="p_name" placeholder="Name">
+      <input id="p_price" type="number" min="0" step="0.01" placeholder="Price">
+      <input id="p_stock" type="number" min="0" step="1" placeholder="Stock">
+      <select id="p_cat"><option value="">Select category</option>${cats.map((c) => `<option value="${c._id}">${esc(c.name)}</option>`).join('')}</select>
+      <input id="p_desc" placeholder="Description"></div>
+      <p><button onclick="run(createProduct)">Create</button></p></div>
+    <div class="tbl" style="margin-top:12px"><table><tr><th>Name</th><th>Category</th><th>Price</th><th>Stock</th><th></th></tr>${rows || '<tr><td colspan="5" class="muted">No products.</td></tr>'}</table></div>`);
+}
+
+async function createProduct() {
+  const body = {
+    name: el('p_name').value.trim(),
+    price: el('p_price').value,
+    stock: el('p_stock').value,
+    category: el('p_cat').value,
+    description: el('p_desc').value.trim()
+  };
+  if (!body.description) delete body.description;
+  await api('/products', { method: 'POST', body });
+  toast('Product created', 'ok'); go('manage');
+}
+
+async function editProduct(id, oldPrice, oldStock) {
+  const price = prompt('New price:', oldPrice);
+  if (price === null) return;
+  const stock = prompt('New stock:', oldStock);
+  if (stock === null) return;
+  await api('/products/' + id, { method: 'PATCH', body: { price: Number(price), stock: Number(stock) } });
+  toast('Product updated', 'ok'); go('manage');
+}
+
+async function delProduct(id) {
+  if (!confirm('Delete this product?')) return;
+  await api('/products/' + id, { method: 'DELETE' });
+  toast('Product deleted', 'ok'); go('manage');
+}
+
+/* ============ REPORTS ============ */
+async function vReports() {
+  const [s, i] = await Promise.all([api('/reports/sales'), api('/reports/inventory')]);
+  const sd = s.data, id = i.data;
+  const cat = sd.categoryWiseSales.map((c) => `<tr><td>${esc(c.category)}</td><td>${money(c.revenue)}</td><td>${c.unitsSold}</td><td>${c.orders}</td></tr>`).join('');
+  const best = id.bestSellingProducts.map((p) => `<tr><td>${esc(p.name)}</td><td>${p.unitsSold}</td><td>${money(p.revenue)}</td><td>${p.currentStock == null ? '-' : p.currentStock}</td></tr>`).join('');
+  const low = id.lowStockProducts.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.category || '-')}</td><td class="low">${p.stock}</td><td>${money(p.price)}</td></tr>`).join('');
+  setView(`<h2>Sales Report</h2>
+    <div class="grid">
+      <div class="card"><div class="muted">Total Revenue</div><div class="price">${money(sd.totalRevenue)}</div></div>
+      <div class="card"><div class="muted">Total Orders</div><div class="price">${sd.totalOrders}</div></div>
+      <div class="card"><div class="muted">Units Sold</div><div class="price">${sd.unitsSold}</div></div></div>
+    <h3>Category-wise Sales</h3><div class="tbl"><table><tr><th>Category</th><th>Revenue</th><th>Units</th><th>Orders</th></tr>${cat || '<tr><td colspan="4" class="muted">No data</td></tr>'}</table></div>
+    <h2>Inventory Report</h2>
+    <h3>Best-selling Products</h3><div class="tbl"><table><tr><th>Product</th><th>Units Sold</th><th>Revenue</th><th>Current Stock</th></tr>${best || '<tr><td colspan="4" class="muted">No data</td></tr>'}</table></div>
+    <h3>Low-stock Products (&lt; ${id.lowStockThreshold})</h3><div class="tbl"><table><tr><th>Product</th><th>Category</th><th>Stock</th><th>Price</th></tr>${low || '<tr><td colspan="4" class="muted">None 🎉</td></tr>'}</table></div>`);
+}
+
+/* ============ CATEGORIES (admin) ============ */
+async function vCategories() {
+  const cats = (await api('/categories', { auth: false })).data;
+  const rows = cats.map((c) => `<tr><td>${esc(c.name)}</td><td>${esc(c.description)}</td><td><button class="danger" onclick="run(delCategory,'${c._id}')">Delete</button></td></tr>`).join('');
+  setView(`<h2>Categories</h2>
+    <div class="card row"><input id="c_name" placeholder="Name"><input id="c_desc" placeholder="Description" style="flex:1"><button onclick="run(createCategory)">Add</button></div>
+    <div class="tbl"><table><tr><th>Name</th><th>Description</th><th></th></tr>${rows || '<tr><td colspan="3" class="muted">None</td></tr>'}</table></div>`);
+}
+async function createCategory() {
+  const body = { name: el('c_name').value.trim() };
+  const d = el('c_desc').value.trim();
+  if (d) body.description = d;
+  await api('/categories', { method: 'POST', body });
+  toast('Category created', 'ok'); go('categories');
+}
+async function delCategory(id) {
+  if (!confirm('Delete this category?')) return;
+  await api('/categories/' + id, { method: 'DELETE' });
+  toast('Category deleted', 'ok'); go('categories');
+}
+
+/* ============ USERS (admin) ============ */
+async function vUsers() {
+  const res = await api('/users?limit=100');
+  const rows = res.data.map((u) => `<tr><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td><span class="badge">${esc(u.role)}</span></td><td>${fmtDate(u.createdAt)}</td></tr>`).join('');
+  setView(`<h2>All Users (${res.pagination.total})</h2><div class="tbl"><table><tr><th>Name</th><th>Email</th><th>Role</th><th>Joined</th></tr>${rows}</table></div>`);
+}
+
+/* ============ PROFILE ============ */
+async function vProfile() {
+  const u = (await api('/users/me')).data;
+  setView(`<h2>My Profile</h2><div class="card" style="max-width:420px">
+    <p class="muted">Role: ${esc(u.role)}</p>
+    <form onsubmit="event.preventDefault();run(saveProfile)">
+      <label class="muted">Name</label><br><input id="u_name" value="${esc(u.name)}" style="width:100%"><br>
+      <label class="muted">Email</label><br><input id="u_email" type="email" value="${esc(u.email)}" style="width:100%"><br>
+      <label class="muted">New password (optional)</label><br><input id="u_pass" type="password" minlength="6" style="width:100%">
+      <p><button>Save</button></p></form></div>`);
+}
+async function saveProfile() {
+  const body = { name: el('u_name').value.trim(), email: el('u_email').value.trim() };
+  const pw = el('u_pass').value;
+  if (pw) body.password = pw;
+  const d = await api('/users/me', { method: 'PATCH', body });
+  S.user = d.data; persist(); renderNav();
+  toast('Profile updated', 'ok');
+}
+
+/* ============ INIT ============ */
+if (S.user && S.access) connectSocket();
+go('products');
+</script>
+</body>
+</html>
